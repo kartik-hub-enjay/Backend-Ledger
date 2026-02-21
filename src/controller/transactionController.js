@@ -18,6 +18,11 @@ const ledgerModel = require("../models/ledgerModel")
  */
 
 async function createTransaction(req,res){
+    
+    /**
+     * 1. Validating request
+     */
+
     const {fromAccount , toAccount , amount , idempotencyKey} = req.body
     if(!fromAccount || !toAccount || !amount || !idempotencyKey){
         return res.status(400).json({
@@ -32,5 +37,45 @@ async function createTransaction(req,res){
     })
     if(!fromUserAccount || !toUserAccount){
         return res.status(400).json({message:"Invalid fromAccount or toAccount"})
+    }
+
+    /**
+     * 2. Validating idempotencyKey
+     */
+
+    const istransactionAlreadyExists = transactionModel.findOne({
+        idempotencyKey: idempotencyKey
+    })
+    if(istransactionAlreadyExists){
+        if(istransactionAlreadyExists.status == "COMPLETED"){
+            return res.status(200).json({message:"transaction successfully completed"})
+        }
+        if(istransactionAlreadyExists.status == "PENDING"){
+            return res.status(200).json({message:"Transaction is still processing"})
+        }
+        if(istransactionAlreadyExists.status == "FAILED"){
+            return res.status(500).json({message:"Transaction is FAILED , please retry"})
+        }
+        if(istransactionAlreadyExists.status == "REVERSED"){
+            return res.status(200).json({message:"Transaction is been reversed , try again"})
+        }
+
+    }
+
+    /**
+     * 3. Checking account status
+     */
+    if(fromAccount.status !== "ACTIVE" || toAccount.status !== "ACTIVE"){
+        return res.status(400).json({message:"from and to account status should be ACTIVE"})
+    }
+
+    /**
+     * 4. Deriving senders balance from ledger
+     */
+    const balance = await fromUserAccount.getBalance()
+    if(balance < amount){
+        return res.status(400).json({
+            message:`Insufficient balance,Current balance is ${balance}. Requested amount is ${amount}`
+        })
     }
 }
