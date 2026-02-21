@@ -1,6 +1,7 @@
 const express = require("express");
 const authRouter = require("./routes/authRoute")
 const accountRouter = require("./routes/accountRoutes");
+const transactionRouter = require("./routes/transactionRoutes")
 const cookieParser = require("cookie-parser")
 
 
@@ -14,6 +15,7 @@ app.get("/", (req, res) => {
 });
 
 app.use("/api/auth",authRouter);
-app.use("api/accounts",accountRouter);
+app.use("/api/accounts",accountRouter);
+app.use("/api/transactions",transactionRouter)
 
 module.exports = app;
