@@ -44,7 +44,7 @@ async function createTransaction(req,res){
      * 2. Validating idempotencyKey
      */
 
-    const istransactionAlreadyExists = transactionModel.findOne({
+    const istransactionAlreadyExists = await transactionModel.findOne({
         idempotencyKey: idempotencyKey
     })
     if(istransactionAlreadyExists){
@@ -67,7 +67,7 @@ async function createTransaction(req,res){
      * 3. Checking account status
      */
 
-    if(fromAccount.status !== "ACTIVE" || toAccount.status !== "ACTIVE"){
+    if(fromUserAccount.status !== "ACTIVE" || toUserAccount.status !== "ACTIVE"){
         return res.status(400).json({message:"from and to account status should be ACTIVE"})
     }
 
@@ -87,63 +87,200 @@ async function createTransaction(req,res){
      */
 
     const session = await mongoose.startSession()
-    session.startTransaction()
+    
+    try {
+        session.startTransaction()
 
-    const transaction = await transactionModel.create({
-        fromAccount,
-        toAccount,
-        amount,
-        idempotencyKey,
-        status:"PENDING"
-    },{session})
+        const transaction = await transactionModel.create([{
+            fromAccount,
+            toAccount,
+            amount,
+            idempotencyKey,
+            status:"PENDING"
+        }],{session})
 
-    /**
-     * 6. Creating DEBIT Ledger entry
-     */
+        /**
+         * 6. Creating DEBIT Ledger entry
+         */
 
-    const debitLedgerEntry = await ledgerModel.create({
-        account:fromAccount,
-        amount:amount,
-        transaction:transaction._id,
-        type:"DEBIT"
-    },{session})
+        const debitLedgerEntry = await ledgerModel.create([{
+            account:fromAccount,
+            amount:amount,
+            transaction:transaction[0]._id,
+            type:"DEBIT"
+        }],{session})
 
-     /**
-     * 7. Creating CREDIT Ledger entry
-     */
+         /**
+         * 7. Creating CREDIT Ledger entry
+         */
 
-    const creditLedgerEntry = await ledgerModel.create({
-        account:toAccount,
-        amount:amount,
-        transaction:transaction._id,
-        type:"DEBIT"
-    },{session})
+        const creditLedgerEntry = await ledgerModel.create([{
+            account:toAccount,
+            amount:amount,
+            transaction:transaction[0]._id,
+            type:"CREDIT"
+        }],{session})
 
-     /**
-     * 8. Mark transaction COMPLETED
-     */
+         /**
+         * 8. Mark transaction COMPLETED
+         */
 
-     transaction.status = "COMPLETED"
-     await transaction.save({session})
+         transaction[0].status = "COMPLETED"
+         await transaction[0].save({session})
 
-     /**
-      * 9. Commit MongoDB session
-      */
+         /**
+          * 9. Commit MongoDB session
+          */
 
-     await session.commitTransaction()
-     session.endSession()
+         await session.commitTransaction()
+         session.endSession()
 
-     /**
-      * 10. Send email notification
-      */
-     await emailService.sendTransactionEmail(req.user.email,req.user.name,amount,toAccount)
-     return res.status(201).json({
-        message:"Transaction completed successfully",
-        transaction:transaction
-     })
+         /**
+          * 10. Send email notification
+          */
+         try {
+             await emailService.sendTransactionEmail(req.user.email,req.user.name,amount,toAccount)
+         } catch(emailError) {
+             console.error('Failed to send transaction email:', emailError)
+             // Don't fail the transaction for email errors
+         }
+         
+         return res.status(201).json({
+            message:"Transaction completed successfully",
+            transaction:transaction[0]
+         })
+
+    } catch(error) {
+        // Rollback transaction on error
+        await session.abortTransaction()
+        session.endSession()
+        
+        console.error('Transaction failed:', error)
+        
+        // Check if it's a duplicate key error (idempotency key already exists)
+        if(error.code === 11000) {
+            return res.status(409).json({
+                message: "Transaction with this idempotency key already exists",
+                status: "failed"
+            })
+        }
+        
+        // Check if it's a write conflict (retry-able error)
+        if(error.code === 112 || error.errorLabels?.includes('TransientTransactionError')) {
+            return res.status(503).json({
+                message: "Transaction conflict occurred. Please retry the operation.",
+                status: "failed",
+                retryable: true
+            })
+        }
+        
+        return res.status(500).json({
+            message: "Transaction failed due to internal error",
+            status: "failed",
+            error: error.message
+        })
+    }
 
 }
 
+async function createInitialFundsTransaction(req,res) {
+    const {toAccount,amount,idempotencyKey} = req.body
+
+    if(!toAccount || !amount || !idempotencyKey){
+        return res.status(400).json({
+            message:"toAccount , amount and idempotencyKey are required"
+        })
+    }
+
+    const toUserAccount = await accountModel.findOne({
+        _id:toAccount
+    })
+
+    if(!toUserAccount){
+        return res.status(400).json({
+            message:"Invalid toAccount"
+        })
+    }
+
+    const fromUserAccount = await accountModel.findOne({
+        
+        user:req.user._id
+    })
+
+    if(!fromUserAccount){
+        return res.status(400).json({
+            message:"System user account not found"
+        })
+    }
+    const session = await mongoose.startSession()
+    
+    try {
+        session.startTransaction()
+
+        const transaction = await transactionModel.create([{
+            fromAccount:fromUserAccount._id,
+            toAccount,
+            amount,
+            idempotencyKey,
+            status:"PENDING"
+        }],{session})
+
+        const debitLedgerEntry = await ledgerModel.create([{
+            account:fromUserAccount._id,
+            amount:amount,
+            transaction:transaction[0]._id,
+            type:"DEBIT"
+        }],{session})
+        
+        const creditLedgerEntry = await ledgerModel.create([{
+            account:toAccount,
+            amount:amount,
+            transaction:transaction[0]._id,
+            type:"CREDIT"
+        }],{session})
+
+        transaction[0].status = "COMPLETED"
+        await transaction[0].save({session})
+
+        await session.commitTransaction()
+        session.endSession()
+
+        return res.status(201).json({
+            message:"Initial funds transaction completed successfully",
+            transaction:transaction[0]
+        })
+    } catch(error) {
+        // Rollback transaction on error
+        await session.abortTransaction()
+        session.endSession()
+        
+        console.error('Initial funds transaction failed:', error)
+        
+        // Check if it's a duplicate key error
+        if(error.code === 11000) {
+            return res.status(409).json({
+                message: "Transaction with this idempotency key already exists",
+                status: "failed"
+            })
+        }
+        
+        // Check if it's a write conflict (retry-able error)
+        if(error.code === 112 || error.errorLabels?.includes('TransientTransactionError')) {
+            return res.status(503).json({
+                message: "Transaction conflict occurred. Please retry the operation.",
+                status: "failed",
+                retryable: true
+            })
+        }
+        
+        return res.status(500).json({
+            message: "Initial funds transaction failed due to internal error",
+            status: "failed",
+            error: error.message
+        })
+    }
+}
 module.exports = {
-    createTransaction
+    createTransaction,
+    createInitialFundsTransaction
 }
